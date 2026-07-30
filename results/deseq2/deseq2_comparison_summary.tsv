@@ -1,0 +1,32 @@
+comparison_type	condition	peptide	comparison	test_group	control_group	n_test	n_control	n_genes_tested	n_padj_lt_cutoff	n_padj_lt_cutoff_abs_lfc_ge_cutoff	status	reason	output_table	output_plot
+peptide_vs_vector	DMSO	A2	DMSO: A2 vs N1	A2	N1	4	6	14176	1910	591	completed		../results/deseq2/tables/DE_DMSO_A2_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_A2_vs_N1.pdf
+peptide_vs_vector	DMSO	B6	DMSO: B6 vs N1	B6	N1	4	6	13820	1230	266	completed		../results/deseq2/tables/DE_DMSO_B6_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_B6_vs_N1.pdf
+peptide_vs_vector	DMSO	T1	DMSO: T1 vs N1	T1	N1	4	6	14044	126	1	completed		../results/deseq2/tables/DE_DMSO_T1_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T1_vs_N1.pdf
+peptide_vs_vector	DMSO	T10	DMSO: T10 vs N1	T10	N1	4	6	14124	568	13	completed		../results/deseq2/tables/DE_DMSO_T10_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T10_vs_N1.pdf
+peptide_vs_vector	DMSO	T4	DMSO: T4 vs N1	T4	N1	4	6	14140	42	0	completed		../results/deseq2/tables/DE_DMSO_T4_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T4_vs_N1.pdf
+peptide_vs_vector	DMSO	T5	DMSO: T5 vs N1	T5	N1	4	6	14142	3	2	completed		../results/deseq2/tables/DE_DMSO_T5_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T5_vs_N1.pdf
+peptide_vs_vector	DMSO	T6	DMSO: T6 vs N1	T6	N1	4	6	13933	4	1	completed		../results/deseq2/tables/DE_DMSO_T6_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T6_vs_N1.pdf
+peptide_vs_vector	DMSO	T7	DMSO: T7 vs N1	T7	N1	4	6	14032	1	0	completed		../results/deseq2/tables/DE_DMSO_T7_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T7_vs_N1.pdf
+peptide_vs_vector	DMSO	T9	DMSO: T9 vs N1	T9	N1	4	6	14216	25	0	completed		../results/deseq2/tables/DE_DMSO_T9_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_T9_vs_N1.pdf
+peptide_vs_vector	DMSO	WT	DMSO: WT vs N1	WT	N1	6	6	14010	22	6	completed		../results/deseq2/tables/DE_DMSO_WT_vs_N1.tsv	../results/deseq2/plots/volcano_DMSO_WT_vs_N1.pdf
+peptide_vs_vector	RITA	A2	RITA: A2 vs N1	A2	N1	4	6	13345	3912	2557	completed		../results/deseq2/tables/DE_RITA_A2_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_A2_vs_N1.pdf
+peptide_vs_vector	RITA	B6	RITA: B6 vs N1	B6	N1	4	6	12929	2526	1433	completed		../results/deseq2/tables/DE_RITA_B6_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_B6_vs_N1.pdf
+peptide_vs_vector	RITA	T1	RITA: T1 vs N1	T1	N1	4	6	12996	70	4	completed		../results/deseq2/tables/DE_RITA_T1_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T1_vs_N1.pdf
+peptide_vs_vector	RITA	T10	RITA: T10 vs N1	T10	N1	4	6	13198	2141	1046	completed		../results/deseq2/tables/DE_RITA_T10_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T10_vs_N1.pdf
+peptide_vs_vector	RITA	T4	RITA: T4 vs N1	T4	N1	4	6	13119	108	26	completed		../results/deseq2/tables/DE_RITA_T4_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T4_vs_N1.pdf
+peptide_vs_vector	RITA	T5	RITA: T5 vs N1	T5	N1	4	6	13089	381	151	completed		../results/deseq2/tables/DE_RITA_T5_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T5_vs_N1.pdf
+peptide_vs_vector	RITA	T6	RITA: T6 vs N1	T6	N1	4	6	12878	552	272	completed		../results/deseq2/tables/DE_RITA_T6_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T6_vs_N1.pdf
+peptide_vs_vector	RITA	T7	RITA: T7 vs N1	T7	N1	4	6	12898	649	248	completed		../results/deseq2/tables/DE_RITA_T7_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T7_vs_N1.pdf
+peptide_vs_vector	RITA	T9	RITA: T9 vs N1	T9	N1	4	6	12957	666	312	completed		../results/deseq2/tables/DE_RITA_T9_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_T9_vs_N1.pdf
+peptide_vs_vector	RITA	WT	RITA: WT vs N1	WT	N1	6	6	12786	84	11	completed		../results/deseq2/tables/DE_RITA_WT_vs_N1.tsv	../results/deseq2/plots/volcano_RITA_WT_vs_N1.pdf
+RITA_vs_DMSO		A2	A2: RITA vs DMSO	RITA	DMSO	4	4	13766	1861	988	completed		../results/deseq2/tables/DE_A2_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_A2_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		B6	B6: RITA vs DMSO	RITA	DMSO	4	4	12911	1475	825	completed		../results/deseq2/tables/DE_B6_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_B6_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		N1	N1: RITA vs DMSO	RITA	DMSO	6	6	13879	5751	3566	completed		../results/deseq2/tables/DE_N1_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_N1_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T1	T1: RITA vs DMSO	RITA	DMSO	4	4	13371	4203	2682	completed		../results/deseq2/tables/DE_T1_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T1_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T10	T10: RITA vs DMSO	RITA	DMSO	4	4	13607	2732	1673	completed		../results/deseq2/tables/DE_T10_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T10_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T4	T4: RITA vs DMSO	RITA	DMSO	4	4	13646	4646	2903	completed		../results/deseq2/tables/DE_T4_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T4_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T5	T5: RITA vs DMSO	RITA	DMSO	4	4	13591	4450	2807	completed		../results/deseq2/tables/DE_T5_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T5_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T6	T6: RITA vs DMSO	RITA	DMSO	4	4	13098	3335	2050	completed		../results/deseq2/tables/DE_T6_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T6_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T7	T7: RITA vs DMSO	RITA	DMSO	4	4	13355	3664	2293	completed		../results/deseq2/tables/DE_T7_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T7_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		T9	T9: RITA vs DMSO	RITA	DMSO	4	4	13557	3163	1888	completed		../results/deseq2/tables/DE_T9_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_T9_RITA_vs_DMSO.pdf
+RITA_vs_DMSO		WT	WT: RITA vs DMSO	RITA	DMSO	6	6	13205	5418	3706	completed		../results/deseq2/tables/DE_WT_RITA_vs_DMSO.tsv	../results/deseq2/plots/volcano_WT_RITA_vs_DMSO.pdf

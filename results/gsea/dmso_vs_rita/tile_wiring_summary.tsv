@@ -1,0 +1,3 @@
+tile	n_pathways	n_sig_RITA	n_sig_DMSO	n_shared	n_RITA_specific	n_DMSO_specific	n_opposite	nes_spearman
+B6	727	144	148	38	83	87	23	0.18201212667033
+A2	727	149	49	26	121	21	2	0.540246116826046

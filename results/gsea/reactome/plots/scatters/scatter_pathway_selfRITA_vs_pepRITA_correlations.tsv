@@ -1,0 +1,9 @@
+tile	n	pearson_all	spearman_all	n_sig_either	pearson_sig	spearman_sig	n_concordant	n_opposed	level	contrast	x_axis	y_axis	shared_sample_bias
+T4	725	-0.162221807407883	-0.211665378214504	291	-0.223936116768426	-0.277053698824927	111	180	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+T5	724	0.0619283338802977	0.0683770945503155	330	0.17845875143039	0.20664635871938	169	161	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+T6	725	-0.127432054519507	-0.137914344959843	284	-0.0514756792465271	0.0663221284186428	96	188	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+T7	725	-0.0816214379482406	-0.116594707531856	333	-0.0468379963539966	-0.00503194197732831	135	198	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+T9	725	-0.478430682835961	-0.548532502845879	337	-0.561282187289685	-0.45642490926102	56	281	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+T10	724	-0.324773498963267	-0.363372023440149	351	-0.40702547839117	-0.269657564657565	83	268	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+A2	725	-0.344112710365733	-0.387971577427578	314	-0.395819820518038	-0.286291245502495	82	232	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE
+B6	725	-0.402556749904235	-0.438101425064829	246	-0.461138954727001	-0.386371046888193	53	193	pathway	selfRITA_vs_pepRITA	tile RITA vs DMSO	tile vs N1 under RITA	shared tile-RITA samples: r biased POSITIVE

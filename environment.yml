@@ -1,0 +1,44 @@
+# Curated conda environment for the viral_peptides BRB-seq analysis.
+# These are the direct dependencies, pinned to the versions actually used.
+#
+#   conda env create -f environment.yml
+#   conda activate brbseq
+#
+# For a bit-for-bit reproduction of the original environment (533 packages,
+# including transitive dependencies), use environment.full.yml instead.
+
+name: brbseq
+
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # ---- alignment / quantification ----
+  - star=2.7.11b
+  - fastqc=0.12.1
+
+  # ---- R ----
+  - r-base=4.5.3
+
+  # differential expression
+  - bioconductor-deseq2=1.50.2
+
+  # pathway enrichment
+  - bioconductor-fgsea=1.36.2
+  - r-msigdbr=26.1.0
+  - bioconductor-annotationdbi=1.72.0
+  - bioconductor-org.hs.eg.db=3.22.0
+
+  # data handling
+  - r-data.table=1.17.8
+  - r-matrix=1.7.5
+  - r-tidyverse=2.0.0
+  - r-stringr
+
+  # plotting
+  - r-ggplot2
+  - r-ggrepel=0.9.6
+  - r-ggrastr=1.0.2
+  - r-pheatmap=1.0.13
