@@ -1,6 +1,6 @@
 # Viral peptide analyses
 
-This repository contains two independent, self-contained analysis projects. They address different questions, use
+This repository contains two independent, self-contained analysis projects for "Peptide tiling across viral proteomes identifies modular regulators of stress-induced cell death" (PMID: 42620239, DOI: https://doi.org/10.64898/2026.08.04.742754). They address different questions, use
 different data and software environments, and can be explored or reproduced
 separately.
 
