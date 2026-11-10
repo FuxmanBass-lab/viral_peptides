@@ -1,0 +1,1169 @@
+import sys
+import os
+import argparse
+import subprocess
+import tempfile
+import csv
+import shutil
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from collections import Counter
+from importlib.util import find_spec
+from pathlib import Path
+import metapredict as mpp
+from tqdm.auto import tqdm
+import multiprocessing
+import math
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROPERTY_ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(
+    description="Calculate peptide disorder, secondary structure, and solvent accessibility."
+)
+parser.add_argument(
+    "--library-csv",
+    type=Path,
+    default=PROPERTY_ROOT / "data" / "VP_library_all_sequences.csv",
+    help="CSV containing the peptide library and NCBI/UniProt identifiers.",
+)
+parser.add_argument(
+    "--proteins-csv",
+    type=Path,
+    default=PROPERTY_ROOT / "data" / "full_library_virus_proteins.csv",
+    help="CSV containing full protein sequences.",
+)
+parser.add_argument(
+    "--screens-xlsx",
+    type=Path,
+    default=REPO_ROOT / "RITA_and_ABT_pos_selection_screens.xlsx",
+    help="Workbook containing the ABT screen (RITA sheet names are not used here).",
+)
+parser.add_argument(
+    "--results-dir",
+    type=Path,
+    default=PROPERTY_ROOT / "results" / "ABT_peptides",
+    help="Directory for generated CSV tables and plots.",
+)
+parser.add_argument(
+    "--netsurfp-dir",
+    type=Path,
+    default=PROPERTY_ROOT / "NetSurfP-3.0_standalone",
+    help="Directory containing nsp3.py and the NetSurfP model.",
+)
+parser.add_argument(
+    "--netsurfp-model",
+    type=Path,
+    help="NetSurfP model checkpoint; defaults to <netsurfp-dir>/models/nsp3.pth.",
+)
+parser.add_argument(
+    "--netsurfp-env",
+    default="nsp3",
+    help="Conda environment used to run NetSurfP (default: nsp3).",
+)
+parser.add_argument(
+    "--netsurfp-python",
+    type=Path,
+    help="Python executable in the NetSurfP environment; bypasses conda run.",
+)
+parser.add_argument(
+    "--netsurfp-processes",
+    type=int,
+    default=1,
+    help="Maximum concurrent NetSurfP model processes (default: 1 to limit memory use).",
+)
+parser.add_argument(
+    "--s4pred-threads",
+    type=int,
+    default=1,
+    help="Number of CPU threads used by S4PRED (default: 1).",
+)
+parser.add_argument(
+    "--max-peptides",
+    type=int,
+    help="Limit structural predictions to the first N VT/VP peptides (for smoke tests).",
+)
+parser.add_argument(
+    "--s4pred-script",
+    type=Path,
+    help="Path to S4PRED's run_model.py when it cannot be located in the active environment.",
+)
+args = parser.parse_args()
+
+for input_path in (args.library_csv, args.proteins_csv, args.screens_xlsx):
+    if not input_path.is_file():
+        parser.error(
+            f"Required input not found: {input_path}. Supply its location with the corresponding option."
+        )
+
+NETSURFP3_STANDALONE_PATH = args.netsurfp_dir.resolve()
+NETSURFP3_STANDALONE_ENV_NAME = args.netsurfp_env
+ENVIRONMENT_MANAGER = (
+    os.environ.get("CONDA_EXE")
+    or shutil.which("conda")
+    or shutil.which("micromamba")
+)
+NETSURFP3_PYTHON = args.netsurfp_python.resolve() if args.netsurfp_python else None
+NSP3_SCRIPT_PATH = NETSURFP3_STANDALONE_PATH / "nsp3.py"
+NSP3_MODEL_PATH = (
+    args.netsurfp_model.resolve()
+    if args.netsurfp_model
+    else NETSURFP3_STANDALONE_PATH / "models" / "nsp3.pth"
+)
+NETSURFP3_BATCH_SIZE = 50
+RSA_BURIED_THRESHOLD = 0.25
+RESULTS_DIR = str(args.results_dir.resolve())
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+for required_path in (NSP3_SCRIPT_PATH, NSP3_MODEL_PATH):
+    if not required_path.is_file():
+        parser.error(
+            f"Required NetSurfP file not found: {required_path}. "
+            "Set --netsurfp-dir or --netsurfp-model."
+        )
+
+if NETSURFP3_PYTHON and not NETSURFP3_PYTHON.is_file():
+    parser.error(f"NetSurfP Python executable not found: {NETSURFP3_PYTHON}")
+if args.netsurfp_processes < 1:
+    parser.error("--netsurfp-processes must be at least 1.")
+if args.s4pred_threads < 1:
+    parser.error("--s4pred-threads must be at least 1.")
+if args.max_peptides is not None and args.max_peptides < 1:
+    parser.error("--max-peptides must be at least 1.")
+
+
+def locate_s4pred_script(explicit_path=None):
+    if explicit_path:
+        candidate = explicit_path.resolve()
+        if candidate.is_file():
+            return str(candidate)
+        raise FileNotFoundError(f"S4PRED run_model.py not found: {candidate}")
+
+    roots = [Path(sys.prefix) / "bin", Path(sys.prefix) / "share" / "s4pred"]
+    roots.extend(Path(entry) for entry in sys.path if entry)
+    spec = find_spec("s4pred")
+    if spec:
+        roots.extend(Path(root) for root in (spec.submodule_search_locations or []))
+        if spec.origin:
+            roots.append(Path(spec.origin).parent)
+
+    for root in roots:
+        for candidate in (root / "run_model.py", root / "s4pred" / "run_model.py"):
+            if candidate.is_file():
+                return str(candidate)
+
+    raise FileNotFoundError(
+        "Could not locate S4PRED's run_model.py in the active Python environment. "
+        "Install S4PRED or pass --s4pred-script /path/to/run_model.py."
+    )
+
+
+run_model_script = locate_s4pred_script(args.s4pred_script)
+
+full_library_df = pd.read_csv(args.library_csv)
+RITA_exp_df = pd.read_excel(args.screens_xlsx, sheet_name="ABT")
+
+full_proteins_df = pd.read_csv(args.proteins_csv)
+if "Identifier" not in full_proteins_df.columns:
+    parser.error(f"{args.proteins_csv} must contain an 'Identifier' column.")
+full_proteins_df['Identifier'] = full_proteins_df['Identifier'].str.split('|').str[0]
+if 'Protein Sequence' in full_proteins_df.columns:
+    full_proteins_df.rename(columns={'Protein Sequence': 'Sequence'}, inplace=True)
+elif 'sequence' in full_proteins_df.columns:
+    full_proteins_df.rename(columns={'sequence': 'Sequence'}, inplace=True)
+if "Sequence" not in full_proteins_df.columns:
+    parser.error(
+        f"{args.proteins_csv} must contain a 'Protein Sequence', 'sequence', or 'Sequence' column."
+    )
+
+required_library_columns = {
+    "code", "identifier", "Aminoacids", "NCBI_id", "Uniprot_id"
+}
+missing_library_columns = required_library_columns.difference(full_library_df.columns)
+if missing_library_columns:
+    parser.error(
+        f"{args.library_csv} is missing required columns: {', '.join(sorted(missing_library_columns))}"
+    )
+
+required_screen_columns = {"type", "tileID", "Aminoacids", "sig", "log2FoldChange", "padj"}
+missing_screen_columns = required_screen_columns.difference(RITA_exp_df.columns)
+if missing_screen_columns:
+    parser.error(
+        f"Sheet 'ABT' in {args.screens_xlsx} is missing required columns: "
+        f"{', '.join(sorted(missing_screen_columns))}"
+    )
+
+
+# Define the 20 standard amino acids for consistent ordering in plots
+AMINO_ACIDS = sorted(list('ACDEFGHIKLMNPQRSTVWY'))
+
+# Helper Function to Calculate Amino Acid Composition 
+def get_amino_acid_composition(sequences):
+    """
+    Calculates the amino acid composition (percentage) for a list of peptide sequences.
+    Handles empty sequences or non-string entries gracefully.
+    """
+    if sequences.empty:
+        return pd.Series({aa: 0.0 for aa in AMINO_ACIDS}, name="Composition")
+
+    total_aa_counts = Counter()
+    total_length = 0
+    # Filter out non-strings or empty strings before processing
+    valid_sequences = [s for s in sequences if isinstance(s, str) and s]
+
+    # If after filtering, there are no valid sequences, return zeros
+    if not valid_sequences:
+        return pd.Series({aa: 0.0 for aa in AMINO_ACIDS}, name="Composition")
+
+    for seq in valid_sequences:
+        total_aa_counts.update(seq)
+        total_length += len(seq)
+
+    if total_length == 0: # This handles cases where valid_sequences might contain only empty strings
+        return pd.Series({aa: 0.0 for aa in AMINO_ACIDS}, name="Composition")
+
+    composition = {aa: (total_aa_counts.get(aa, 0) / total_length) * 100 for aa in AMINO_ACIDS}
+    return pd.Series(composition, name="Composition")
+
+# Helper Function to Plot Amino Acid Composition 
+def plot_composition(composition_series_dict, title, filename_prefix, results_dir):
+    """
+    Plots amino acid composition for one or more groups using grouped bar plots.
+    composition_series_dict: dict of {group_name: pandas.Series of composition}
+    """
+    if not composition_series_dict:
+        print(f"Skipping plot '{title}': No data provided.")
+        return
+
+    # Convert dictionary of Series to a DataFrame for easier plotting
+    plot_df_data = []
+    for group_name, series in composition_series_dict.items():
+        if series is not None and not series.empty: # Ensure series is not None or empty
+            temp_df = series.reset_index()
+            temp_df.columns = ['Amino Acid', 'Percentage']
+            temp_df['Group'] = group_name
+            plot_df_data.append(temp_df)
+        else:
+            print(f"Warning: No valid composition data for group '{group_name}' in '{title}'.")
+
+    if not plot_df_data:
+        print(f"Skipping plot '{title}': No valid dataframes to concatenate.")
+        return
+
+    plot_df = pd.concat(plot_df_data)
+
+    plt.figure(figsize=(14, 7))
+    sns.barplot(data=plot_df, x='Amino Acid', y='Percentage', hue='Group', palette='viridis', ci=None) # ci=None for no confidence intervals as it's aggregated data
+    plt.title(f'Amino Acid Composition: {title}', fontsize=16)
+    plt.xlabel('Amino Acid', fontsize=12)
+    plt.ylabel('Percentage (%)', fontsize=12)
+    plt.xticks(rotation=0)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.legend(title='Group', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plot_path = os.path.join(results_dir, f"{filename_prefix}_amino_acid_composition.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f"Saved plot: {plot_path}")
+
+# Filter DataFrames for VT or VP peptides 
+print("\nFiltering Data ")
+full_library_filtered = full_library_df[full_library_df['code'].isin(['VT', 'VP'])].copy()
+RITA_exp_filtered = RITA_exp_df[RITA_exp_df['type'].isin(['VT', 'VP'])].copy()
+
+print(f"Number of peptides in full library (VT/VP): {len(full_library_filtered)}")
+print(f"Number of peptides used in RITA experiment (VT/VP): {len(RITA_exp_filtered)}")
+
+print("\nGenerating comprehensive peptide amino acid composition and metadata table...")
+
+# Start with the basic peptide info (identifier and sequence) from the filtered full library
+comprehensive_peptide_table_aa = full_library_filtered[['identifier', 'Aminoacids']].copy()
+
+# Calculate amino acid percentages for each individual peptide
+aa_composition_per_peptide_df = comprehensive_peptide_table_aa['Aminoacids'].apply(lambda seq: pd.Series({
+    aa: (Counter(seq).get(aa, 0) / len(seq)) * 100 if len(seq) > 0 else 0.0
+    for aa in AMINO_ACIDS
+}))
+
+# Concatenate the calculated percentages with the initial identifier and Aminoacids columns
+comprehensive_peptide_table_aa = pd.concat([comprehensive_peptide_table_aa, aa_composition_per_peptide_df], axis=1)
+
+# Prepare RITA experiment data for merging
+RITA_exp_filtered['identifier'] = RITA_exp_filtered['tileID']
+rita_metadata_for_merge_aa = RITA_exp_filtered[['identifier', 'sig', 'log2FoldChange', 'padj']].copy()
+
+# Ensure log2FoldChange and padj are numeric before potential calculations or display
+rita_metadata_for_merge_aa['log2FoldChange'] = pd.to_numeric(rita_metadata_for_merge_aa['log2FoldChange'], errors='coerce')
+rita_metadata_for_merge_aa['padj'] = pd.to_numeric(rita_metadata_for_merge_aa['padj'], errors='coerce')
+
+
+# Merge RITA experiment metadata
+# Use a left merge to ensure all peptides from comprehensive_peptide_table_aa are kept.
+# Peptides not found in rita_metadata_for_merge_aa (i.e., not used in the experiment)
+# will have NaN values in the newly merged 'significant', 'log_FC', and 'adj_p_val' columns.
+comprehensive_peptide_table_aa = comprehensive_peptide_table_aa.merge(
+    rita_metadata_for_merge_aa,
+    on='identifier',
+    how='left'
+)
+
+# Display the first few rows of the new table
+print("\nFirst 5 rows of the comprehensive peptide amino acid composition table:")
+print(comprehensive_peptide_table_aa.head())
+print(f"\nShape of the comprehensive peptide amino acid composition table: {comprehensive_peptide_table_aa.shape}")
+print(f"Columns in the comprehensive peptide amino acid composition table: {comprehensive_peptide_table_aa.columns.tolist()}")
+
+
+# Save the comprehensive table to a CSV file
+comprehensive_table_path_aa = os.path.join(RESULTS_DIR, "comprehensive_peptide_amino_acid_composition_and_metadata.csv")
+comprehensive_peptide_table_aa.to_csv(comprehensive_table_path_aa, index=False)
+print(f"\nSaved comprehensive peptide amino acid composition table to: {comprehensive_table_path_aa}")
+
+
+# Calculate Amino Acid Compositions for Each Group 
+print("\nCalculating Amino Acid Compositions ")
+
+# Full Library (VT/VP only)
+comp_full_library = get_amino_acid_composition(full_library_filtered['Aminoacids'])
+
+# Experiment Used (VT/VP only)
+comp_exp_used = get_amino_acid_composition(RITA_exp_filtered['Aminoacids'])
+
+# Peptides Used vs. Not Used in Experiment (from the VT/VP filtered library)
+used_sequences_set = set(RITA_exp_filtered['Aminoacids'].unique())
+not_used_peptides_df = full_library_filtered[~full_library_filtered['Aminoacids'].isin(used_sequences_set)]
+
+comp_exp_not_used = get_amino_acid_composition(not_used_peptides_df['Aminoacids'])
+
+num_used = len(used_sequences_set)
+num_not_used = len(not_used_peptides_df['Aminoacids'].unique()) # Unique counts for 'not used'
+print(f"\nComparison of Used vs. Not Used peptides (from VT/VP library):")
+print(f"  Total unique peptides in full library (VT/VP): {len(full_library_filtered['Aminoacids'].unique())}")
+print(f"  Unique peptides USED in experiment: {num_used} ({num_used / len(full_library_filtered['Aminoacids'].unique()):.2%})")
+print(f"  Unique peptides NOT USED in experiment: {num_not_used} ({num_not_used / len(full_library_filtered['Aminoacids'].unique()):.2%})")
+
+
+# Experiment Significant vs. Non-Significant (from VT/VP used in experiment)
+RITA_sig = RITA_exp_filtered[RITA_exp_filtered['sig'] == 'Yes']
+RITA_non_sig = RITA_exp_filtered[RITA_exp_filtered['sig'] == 'No']
+
+comp_exp_sig = get_amino_acid_composition(RITA_sig['Aminoacids'])
+comp_exp_non_sig = get_amino_acid_composition(RITA_non_sig['Aminoacids'])
+
+print(f"\nSignificant vs. Non-Significant peptides (from VT/VP used in experiment):")
+print(f"  Number of significant peptides: {len(RITA_sig)}")
+print(f"  Number of non-significant peptides: {len(RITA_non_sig)}")
+
+# Experiment Upregulated vs. Downregulated Significant (from VT/VP used and significant)
+# Ensure log2FoldChange is numeric before comparison
+RITA_sig['log2FoldChange'] = pd.to_numeric(RITA_sig['log2FoldChange'], errors='coerce')
+RITA_up = RITA_sig[RITA_sig['log2FoldChange'] > 0]
+RITA_down = RITA_sig[RITA_sig['log2FoldChange'] < 0]
+
+comp_exp_up = get_amino_acid_composition(RITA_up['Aminoacids'])
+comp_exp_down = get_amino_acid_composition(RITA_down['Aminoacids'])
+
+print(f"\nUpregulated vs. Downregulated Significant peptides:")
+print(f"  Number of upregulated significant peptides: {len(RITA_up)}")
+print(f"  Number of downregulated significant peptides: {len(RITA_down)}")
+print(f"  Number of significant peptides with logFC = 0 (or NaN): {len(RITA_sig) - len(RITA_up) - len(RITA_down)}")
+
+
+# Combine Compositions into a Summary DataFrame and Save 
+print("\nGenerating Summary Table ")
+all_compositions = pd.DataFrame({
+    'Full_Library_VT_VP': comp_full_library,
+    'Experiment_Used_VT_VP': comp_exp_used,
+    'Experiment_Not_Used_VT_VP': comp_exp_not_used,
+    'Experiment_Significant_VT_VP': comp_exp_sig,
+    'Experiment_NonSignificant_VT_VP': comp_exp_non_sig,
+    'Experiment_Upregulated_VT_VP': comp_exp_up,
+    'Experiment_Downregulated_VT_VP': comp_exp_down
+})
+
+# Round to 2 decimal places for presentation
+all_compositions = all_compositions.round(2)
+
+print("\nAmino Acid Composition Summary (Percentages):")
+print(all_compositions)
+
+summary_table_path = os.path.join(RESULTS_DIR, "amino_acid_composition_summary.csv")
+all_compositions.to_csv(summary_table_path)
+print(f"\nSaved amino acid composition summary table: {summary_table_path}")
+
+# Plotting the Compositions 
+print("\nGenerating Plots ")
+
+# Plot 1: Full Library vs. Experiment Used
+plot_composition(
+    {'Full Library (VT/VP)': comp_full_library, 'Experiment Used (VT/VP)': comp_exp_used},
+    'Full Library vs. Experiment Used Peptides (VT/VP)',
+    'full_vs_used',
+    RESULTS_DIR
+)
+
+# Plot 2: Experiment Used vs. Not Used
+plot_composition(
+    {'Experiment Used (VT/VP)': comp_exp_used, 'Experiment Not Used (VT/VP)': comp_exp_not_used},
+    'Experiment Used vs. Not Used Peptides (VT/VP)',
+    'used_vs_not_used',
+    RESULTS_DIR
+)
+
+# Plot 3: Experiment Significant vs. Non-Significant
+plot_composition(
+    {'Significant (VT/VP)': comp_exp_sig, 'Non-Significant (VT/VP)': comp_exp_non_sig},
+    'Experiment Significant vs. Non-Significant Peptides (VT/VP)',
+    'significant_vs_nonsignificant',
+    RESULTS_DIR
+)
+
+# Plot 4: Experiment Upregulated vs. Downregulated Significant
+plot_composition(
+    {'Upregulated Significant (VT/VP)': comp_exp_up, 'Downregulated Significant (VT/VP)': comp_exp_down},
+    'Upregulated vs. Downregulated Significant Peptides (VT/VP)',
+    'upregulated_vs_downregulated',
+    RESULTS_DIR
+)
+
+# Plot 5: Experiment Subset Comparisons
+plot_composition(
+    {'Full Library (VT/VP)': comp_full_library,
+    'Significant (VT/VP)': comp_exp_sig, 
+    'Non-Significant (VT/VP)': comp_exp_non_sig,
+    'Upregulated Significant (VT/VP)': comp_exp_up, 
+    'Downregulated Significant (VT/VP)': comp_exp_down},
+    'Comparison of Peptides (VT/VP)',
+    'comparison_peptide_amino_acid_comparison',
+    RESULTS_DIR
+)
+
+print("\nAnalysis Complete! Check your results directory for the summary CSV and plots.")
+
+
+
+
+def _extend_protein_sequence(original_seq, target_length):
+    """
+    Extends a protein sequence by repeating it until it reaches the target_length.
+    If original_seq is empty, returns an empty string.
+    If original_seq is already long enough, returns original_seq.
+    """
+    if len(original_seq) == 0:
+        return ""
+    if len(original_seq) >= target_length:
+        return original_seq
+
+    # Calculate how many full repeats are needed
+    num_repeats = math.ceil(target_length / len(original_seq))
+    extended_seq = (original_seq * num_repeats)
+    
+    # Trim if it's longer than needed, but ensure it's at least target_length
+    return extended_seq[:max(len(original_seq), target_length)]
+
+
+def get_unique_full_protein_info(full_library_proteins_df):
+    """
+    Extracts unique full protein sequences and their Identifier for NetSurfP-3 input.
+    Returns a dictionary {Identifier: sequence} and a DataFrame suitable for NetsurfP-3 input.
+    Assumes full_library_proteins_df has 'Identifier' and a 'Sequence' column.
+    """
+    # Ensure 'Sequence' column is string and not empty, and 'Identifier' is present
+    unique_proteins_df = full_library_proteins_df[
+        full_library_proteins_df['Sequence'].apply(lambda x: isinstance(x, str) and len(x) > 0)
+    ].copy()
+    
+    # Drop duplicates based on Identifier and sequence to ensure unique proteins for prediction
+    unique_proteins_df = unique_proteins_df.drop_duplicates(subset=['Identifier', 'Sequence'])
+
+    protein_sequences_dict = unique_proteins_df.set_index('Identifier')['Sequence'].to_dict()
+    # Create a DataFrame for input to NetSurfP-3
+    protein_input_df = unique_proteins_df[['Identifier', 'Sequence']].rename(columns={'Identifier': 'identifier', 'Sequence': 'Aminoacids'})
+    return protein_sequences_dict, protein_input_df
+
+# Helper function for buried/exposed prediction with netsurfp3
+def _run_single_netsurfp3_batch(batch_input_df_args):
+    """
+    Worker function to run standalone NetSurfP-3 for a single batch of proteins.
+    Returns a dictionary of {protein_id: [RSA_scores]} for the batch.
+    """
+    batch_index, batch_df = batch_input_df_args
+    batch_results = {}
+    fasta_input_path = None
+    output_dir = None
+
+    KEEP_TEMP_FILES = False 
+
+    try:
+        # Check if batch_df is empty after potential subsetting or filtering
+        if batch_df.empty:
+            sys.stderr.write(f"Warning (Batch {batch_index}): Input DataFrame for NetSurfP-3 batch is empty. Skipping.\n")
+            return batch_results
+
+        # Create temporary FASTA input file for this batch
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=f"_batch{batch_index}.fasta") as fasta_file:
+            fasta_input_path = fasta_file.name
+            for _, row in batch_df.iterrows():
+                fasta_file.write(f">{row['identifier']}\n{row['Aminoacids']}\n")
+
+        # Create a temporary output directory for this batch's NetSurfP-3.0 results
+        output_dir = tempfile.mkdtemp(prefix=f"nsp3_standalone_output_batch{batch_index}_")
+
+        if NETSURFP3_PYTHON:
+            command = [str(NETSURFP3_PYTHON), str(NSP3_SCRIPT_PATH)]
+        else:
+            if not ENVIRONMENT_MANAGER:
+                raise RuntimeError(
+                    "Could not find conda or micromamba to run NetSurfP. "
+                    "Install one of these environment managers, or pass "
+                    "--netsurfp-python /path/to/nsp3/bin/python."
+                )
+            command = [
+                ENVIRONMENT_MANAGER, "run", "-n", NETSURFP3_STANDALONE_ENV_NAME,
+                "python", str(NSP3_SCRIPT_PATH),
+            ]
+        command.extend([
+            "-m", str(NSP3_MODEL_PATH),
+            "-i", fasta_input_path,
+            "-o", output_dir,
+        ])
+        
+        print(f" (Batch {batch_index}): Running NetSurfP-3 command: {' '.join(command)}")
+
+        # Execute the command, capturing stdout and stderr.
+        process = subprocess.run(command, check=True, capture_output=True, text=True)
+               
+        print(f"NetSurfP-3 completed for batch {batch_index}. Checking output...")
+
+        # Find the subdirectory created by NetSurfP-3.0 (e.g., '01', '02', etc.)
+        # This subdirectory contains the actual output files for the batch.
+        subdirs = [d for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]
+        
+        if not subdirs:
+            raise RuntimeError(
+                f"NetSurfP-3 produced no result directory for batch {batch_index} in {output_dir}."
+            )
+        
+        # Assume there's only one relevant subdirectory per batch for now (e.g., '01', '02', etc. per job run)
+        job_output_subdir_name = subdirs[0]
+        job_output_subdir_path = os.path.join(output_dir, job_output_subdir_name)
+
+        # NetSurfP names the summary file after its worker directory.
+        main_csv_filepath = os.path.join(job_output_subdir_path, f"{job_output_subdir_name}.csv") 
+
+        if not os.path.exists(main_csv_filepath):
+            raise FileNotFoundError(
+                f"NetSurfP-3 did not produce the expected result file: {main_csv_filepath}"
+            )
+
+        protein_rsa_scores_accumulator = {} # Accumulate scores for each protein in this batch
+        with open(main_csv_filepath, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+
+            if not reader.fieldnames or ' rsa' not in reader.fieldnames or 'id' not in reader.fieldnames:
+                raise ValueError(
+                    f"NetSurfP-3 result has unexpected columns in {main_csv_filepath}: "
+                    f"{reader.fieldnames}"
+                )
+
+            for row in reader:
+                try:
+                    current_protein_id = row['id'].lstrip('>') 
+                    rsa_value = float(row[' rsa']) # Get RSA value from lowercase ' rsa' column (yes it needs to have a space, as the developer put spaces in the columns)
+                    
+                    if current_protein_id not in protein_rsa_scores_accumulator:
+                        protein_rsa_scores_accumulator[current_protein_id] = []
+                    
+                    protein_rsa_scores_accumulator[current_protein_id].append(rsa_value)
+                except (ValueError, KeyError) as parse_e:
+                    sys.stderr.write(f"Warning (Batch {batch_index}): Error parsing row in {main_csv_filepath}: {row}. Error: {parse_e}. Skipping row.\n")
+                    continue
+        
+        # After processing all rows, populate batch_results
+        batch_results.update(protein_rsa_scores_accumulator)
+        
+        if not batch_results:
+            raise ValueError(
+                f"No valid RSA scores were extracted from NetSurfP-3 output: {main_csv_filepath}"
+            )
+
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"Error running standalone NetSurfP-3 for batch {batch_index} (command: {' '.join(command)}): {e}\n")
+        sys.stderr.write(f"Stdout (first 500 chars):\n{e.stdout[:500]}...\n")
+        sys.stderr.write(f"Stderr:\n{e.stderr}\n")
+        raise # Re-raise the error as it's critical
+    except (FileNotFoundError, ValueError) as e:
+        sys.stderr.write(f"Error for batch {batch_index}: {e}\n")
+        raise
+    except Exception as e:
+        sys.stderr.write(f"An unexpected error occurred during standalone NetSurfP-3 execution or output parsing for batch {batch_index}: {e}\n")
+        raise
+    finally:
+        # Clean up temporary files and directories for this batch
+        if not KEEP_TEMP_FILES: # Only delete if KEEP_TEMP_FILES is False
+            if fasta_input_path and os.path.exists(fasta_input_path):
+                os.remove(fasta_input_path)
+            if output_dir and os.path.exists(output_dir):
+                import shutil
+                shutil.rmtree(output_dir)
+            
+    return batch_results
+
+
+def run_netsurfp3_standalone_prediction(input_df, num_netsurfp3_processes=None):
+    """
+    Runs NetSurfP-3 prediction for a given DataFrame of proteins using the standalone package,
+    parallelizing by splitting into batches.
+    Args:
+        input_df (pd.DataFrame): DataFrame with 'identifier' and 'Aminoacids' columns (for FASTA input).
+        num_netsurfp3_processes (int, optional): Number of concurrent NetSurfP-3 model processes.
+                                                If None, uses --netsurfp-processes.
+    Returns:
+        dict: Parsed prediction results: {identifier: [RSA_scores_list]}.
+              Returns an empty dict if input_df is empty.
+    Raises:
+        Exception: If any error occurs during standalone execution or parsing.
+    """
+    if input_df.empty:
+        print("Warning: No proteins to predict for NetSurfP-3 standalone.")
+        return {}
+
+    if not os.path.exists(NSP3_SCRIPT_PATH):
+        raise FileNotFoundError(f"NetSurfP-3 standalone script not found: {NSP3_SCRIPT_PATH}. "
+                                f"Please verify NETSURFP3_STANDALONE_PATH.")
+    if not os.path.exists(NSP3_MODEL_PATH):
+        raise FileNotFoundError(f"NetSurfP-3 standalone model not found: {NSP3_MODEL_PATH}. "
+                                f"Please verify NETSURFP3_STANDALONE_PATH and 'models/nsp3.pth'.")
+    
+    if num_netsurfp3_processes is None:
+        num_netsurfp3_processes = args.netsurfp_processes
+
+    # Split the input DataFrame into batches
+    num_proteins = len(input_df)
+    num_batches = math.ceil(num_proteins / NETSURFP3_BATCH_SIZE)
+    batches = []
+    for i in range(num_batches):
+        start_idx = i * NETSURFP3_BATCH_SIZE
+        end_idx = min((i + 1) * NETSURFP3_BATCH_SIZE, num_proteins)
+        batches.append((i, input_df.iloc[start_idx:end_idx])) # Pass index and batch_df
+
+    print(f"\nRunning {num_proteins} proteins in {num_batches} batches on {num_netsurfp3_processes} processes for NetSurfP-3 (standalone)...")
+    
+    total_rsa_map = {}
+    if num_netsurfp3_processes == 1:
+        for batch in tqdm(batches, desc="NetSurfP-3 batches (1 process)"):
+            total_rsa_map.update(_run_single_netsurfp3_batch(batch))
+    else:
+        with multiprocessing.Pool(processes=num_netsurfp3_processes) as pool:
+            for batch_results in tqdm(pool.imap_unordered(_run_single_netsurfp3_batch, batches),
+                                      total=num_batches,
+                                      desc=f"NetSurfP-3 batches ({num_netsurfp3_processes} processes)"):
+                total_rsa_map.update(batch_results)
+
+    return total_rsa_map
+
+
+# WORKER FUNCTION FOR PARALLEL PROCESSING
+def _process_single_peptide_properties(args):
+    """
+    Worker function to calculate properties for a single peptide, including buried/exposed status.
+    This function will be run in parallel processes.
+    It now expects the *extended* full protein sequence and its corresponding RSA scores
+    for accurate buried/exposed calculation for short proteins.
+    """
+    peptide_id, seq, s4pred_pred_string, threshold_disorder, full_protein_seq_extended, protein_rsa_scores_extended, rsa_buried_threshold, protein_id = args
+
+    initial_props = {f'{prop}_perc': 0.0 for prop in PEPTIDE_PROPERTY_TYPES}
+    return_dict = {'identifier': peptide_id, **initial_props}
+
+    if len(seq) == 0:
+        return return_dict
+
+    total_residues = len(seq)
+
+    # 1. Disorder Prediction (metapredict)
+    disorder_scores = mpp.predict_disorder(seq)
+
+    # Secondary structure prediction string is passed in
+    if len(s4pred_pred_string) != len(seq):
+        print(f"Warning (process {os.getpid()}): s4pred prediction length mismatch for peptide {peptide_id} ({len(s4pred_pred_string)} vs {len(seq)}). Assuming all coil for SS part.")
+        s4pred_pred_string = 'C' * len(seq)
+
+    # 2. Combine and make mutually exclusive: Disorder (D) overrides SS (H, E, C)
+    combined_prediction = []
+    for j in range(len(seq)):
+        if disorder_scores[j] >= threshold_disorder:
+            combined_prediction.append('D') # Disordered
+        else:
+            combined_prediction.append(s4pred_pred_string[j]) # H, E, or C
+    combined_prediction_string = "".join(combined_prediction)
+
+    # 3. Calculate SS and Disorder percentages
+    return_dict['Disorder_perc'] = (combined_prediction_string.count('D') / total_residues) * 100
+    return_dict['Helix_perc'] = (combined_prediction_string.count('H') / total_residues) * 100
+    return_dict['Sheet_perc'] = (combined_prediction_string.count('E') / total_residues) * 100
+    return_dict['Coil_perc'] = (combined_prediction_string.count('C') / total_residues) * 100
+
+    # 4. Buried/Exposed calculation using full protein RSA scores
+    # Check if we have both the extended full protein sequence and its RSA scores, and if their lengths match.
+    if full_protein_seq_extended and protein_rsa_scores_extended and len(full_protein_seq_extended) == len(protein_rsa_scores_extended):
+        
+        start_index = -1
+        matched_seq_len = 0
+        stripped_m_attempted = False
+
+        # Attempt 1: Try finding the peptide directly (original sequence)
+        start_index = full_protein_seq_extended.find(seq)
+        if start_index != -1:
+            matched_seq_len = len(seq)
+        
+        # Attempt 2: If original not found, and peptide starts with 'M', try without the leading 'M'
+        if start_index == -1 and seq.startswith('M') and len(seq) > 1:
+            search_seq_stripped = seq[1:]
+            start_index = full_protein_seq_extended.find(search_seq_stripped)
+            if start_index != -1:
+                matched_seq_len = len(search_seq_stripped)
+                stripped_m_attempted = True # Mark that stripping was successful
+        
+        # If the peptide (or its M-stripped version) was found:
+        if start_index != -1:
+            peptide_rsa_slice = protein_rsa_scores_extended[start_index : start_index + matched_seq_len]
+            
+            if len(peptide_rsa_slice) == matched_seq_len:
+                buried_count = sum(1 for rsa in peptide_rsa_slice if rsa < rsa_buried_threshold)
+                exposed_count = len(peptide_rsa_slice) - buried_count
+                
+                return_dict['Buried_perc'] = (buried_count / matched_seq_len) * 100
+                return_dict['Exposed_perc'] = (exposed_count / matched_seq_len) * 100
+            else:
+                sys.stderr.write(f"Warning: RSA slice length mismatch for peptide '{peptide_id}' (Protein ID: {protein_id}, seq: '{seq[:20]}...'). "
+                                 f"Expected {matched_seq_len}, got {len(peptide_rsa_slice)}. "
+                                 f"This might indicate an issue with RSA score generation. Buried/Exposed percentages will be 0.\n")
+        else:
+            reason_attempted = ""
+            if stripped_m_attempted:
+                reason_attempted = f" (tried original '{seq[:20]}...' and stripped 'M': '{seq[1:21]}...')"
+            elif seq.startswith('M') and len(seq) > 1:
+                 reason_attempted = f" (tried original '{seq[:20]}...'; M-stripped failed too)"
+            else:
+                 reason_attempted = f" (original sequence '{seq[:20]}...')"
+
+            sys.stderr.write(f"Warning: Peptide '{peptide_id}'{reason_attempted} not found in its extended full protein sequence (Protein ID: {protein_id}). Buried/Exposed percentages will be 0.\n")
+    else:
+        sys.stderr.write(f"Warning: Missing extended full protein sequence or RSA scores for protein '{protein_id}' (peptide '{peptide_id}'), "
+                         f"or length mismatch (full_seq len: {len(full_protein_seq_extended) if full_protein_seq_extended else 0} vs rsa scores len: {len(protein_rsa_scores_extended) if protein_rsa_scores_extended else 0}). "
+                         f"Buried/Exposed percentages will be 0.\n")
+
+    return return_dict
+
+
+# Helper Function to Get Peptide Properties (Disorder, Secondary Structure, Exposed/Buried)
+def calculate_all_peptide_structural_properties(peptides_df_for_structural_analysis, full_proteins_df, threshold_disorder=0.5, rsa_buried_threshold=0.25, num_processes=None, num_netsurfp3_processes=None):
+    """
+    Calculates all peptide properties (Disorder, SS, Buried/Exposed).
+    Orchestrates full protein RSA prediction and then individual peptide property calculation.
+    Includes logic to extend short proteins before RSA prediction.
+    
+    Args:
+        peptides_df_for_structural_analysis (pd.DataFrame): DataFrame with 'identifier', 'Aminoacids', and 'Protein_ID' columns.
+        full_proteins_df (pd.DataFrame): DataFrame with 'Identifier' and 'Sequence' columns for full proteins.
+        threshold_disorder (float): Disorder score threshold for metapredict.
+        rsa_buried_threshold (float): RSA threshold for classifying residues as buried.
+            num_processes (int, optional): Number of CPU cores to use for parallel processing for general peptide properties.
+            num_netsurfp3_processes (int, optional): Number of concurrent NetSurfP-3 model processes.
+    Returns:
+        pd.DataFrame: A DataFrame indexed by 'identifier' with all calculated percentage columns.
+    """
+    if peptides_df_for_structural_analysis.empty:
+        return pd.DataFrame(columns=[f'{prop}_perc' for prop in PEPTIDE_PROPERTY_TYPES])
+
+    initial_peptide_count = len(peptides_df_for_structural_analysis)
+    peptides_df_for_structural_analysis = peptides_df_for_structural_analysis[peptides_df_for_structural_analysis['Protein_ID'].notna()]
+    if len(peptides_df_for_structural_analysis) < initial_peptide_count:
+        removed_count = initial_peptide_count - len(peptides_df_for_structural_analysis)
+        sys.stderr.write(f"Warning: Removed {removed_count} peptides due to missing 'Protein_ID'. These peptides will have 0% for structural properties.\n")
+
+    # (Original filtering for empty/non-string amino acids)
+    valid_peptides_df = peptides_df_for_structural_analysis[
+        peptides_df_for_structural_analysis['Aminoacids'].apply(lambda x: isinstance(x, str) and len(x) > 0)
+    ].copy()
+
+    if valid_peptides_df.empty:
+        return pd.DataFrame(columns=[f'{prop}_perc' for prop in PEPTIDE_PROPERTY_TYPES])
+
+    # 1. Get unique full proteins and their *original* sequences
+    # Protein identifiers in the peptide and full-protein tables must use the same namespace.
+    original_full_protein_sequences_dict, full_protein_nsp3_input_df = get_unique_full_protein_info(full_proteins_df)
+
+    # Extend short proteins for NetSurfP-3 input
+    extended_protein_nsp3_input_df_data = []
+    extended_full_protein_sequences_dict = {} # To store the extended sequences for direct lookup
+    
+    # Iterate through unique Protein_IDs to find the max peptide length for each
+    unique_protein_ids = valid_peptides_df['Protein_ID'].unique()
+    
+    # Store max peptide length per protein, to ensure protein is at least that long
+    max_peptide_len_per_protein = {}
+    for protein_id in unique_protein_ids:
+        peptides_for_this_protein = valid_peptides_df[valid_peptides_df['Protein_ID'] == protein_id]
+        if not peptides_for_this_protein.empty:
+            max_peptide_len_per_protein[protein_id] = max(len(p_seq) for p_seq in peptides_for_this_protein['Aminoacids'] if isinstance(p_seq, str))
+        else:
+            max_peptide_len_per_protein[protein_id] = 0
+            
+    for protein_id, original_seq in original_full_protein_sequences_dict.items():
+        # The protein needs to be at least as long as its original sequence, AND as long as the longest peptide associated with it
+        # If no peptides associated (e.g. from filtering), just use original length
+        required_min_len = max_peptide_len_per_protein.get(protein_id, 0)
+        target_len_for_extension = max(len(original_seq), required_min_len)
+        
+        extended_seq = _extend_protein_sequence(original_seq, target_len_for_extension)
+        extended_full_protein_sequences_dict[protein_id] = extended_seq
+        
+        extended_protein_nsp3_input_df_data.append({
+            'identifier': protein_id, 
+            'Aminoacids': extended_seq
+        })
+        
+        if len(original_seq) < target_len_for_extension: # Only print debug if extension actually happened
+            print(f"Extended protein {protein_id} from {len(original_seq)} to {len(extended_seq)} residues.")
+
+    extended_protein_nsp3_input_df = pd.DataFrame(extended_protein_nsp3_input_df_data)
+
+    # 2. Run NetSurfP-3 for RSA on all unique *extended* full proteins (PARALLELIZED)
+    print(f"\nPredicting RSA for {len(extended_protein_nsp3_input_df)} unique (potentially extended) full proteins using NetSurfP-3 (standalone, parallelized)...")
+    protein_rsa_map = run_netsurfp3_standalone_prediction(extended_protein_nsp3_input_df, num_netsurfp3_processes=num_netsurfp3_processes)
+    print("NetSurfP-3 RSA prediction complete.")
+    
+    # 3. Run S4PRED for secondary structure on all peptides (same logic as before)
+    fasta_input_path_s4pred = None
+    s4pred_output_path = None
+    s4pred_map = {}
+
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".fasta") as fasta_file:
+            fasta_input_path_s4pred = fasta_file.name
+            for _, row in valid_peptides_df.iterrows():
+                fasta_file.write(f">{row['identifier']}\n{row['Aminoacids']}\n")
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".ss_fas") as output_file:
+            s4pred_output_path = output_file.name
+            command = [
+                sys.executable, run_model_script, "--outfmt", "fas",
+                "--threads", str(args.s4pred_threads), fasta_input_path_s4pred,
+            ]
+            print(f"\nRunning s4pred via subprocess: {' '.join(command)}")
+            try:
+                subprocess.run(command, check=True, stdout=output_file, stderr=subprocess.PIPE, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error running s4pred (command: {' '.join(command)}): {e}")
+                print(f"Stderr: {e.stderr}")
+                raise
+
+        current_id = None
+        current_seq_line = None
+        with open(s4pred_output_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    current_id = line[1:]
+                    current_seq_line = None
+                elif current_id and current_seq_line is None:
+                    current_seq_line = line
+                elif current_id and current_seq_line is not None:
+                    s4pred_map[current_id] = line
+                    current_id = None
+                    current_seq_line = None
+
+    finally:
+        if fasta_input_path_s4pred and os.path.exists(fasta_input_path_s4pred): os.remove(fasta_input_path_s4pred)
+        if s4pred_output_path and os.path.exists(s4pred_output_path): os.remove(s4pred_output_path)
+    # END S4PRED SUBPROCESS BLOCK
+
+    # Prepare arguments for parallel processing for each peptide
+    task_args = []
+    for _, row in valid_peptides_df.iterrows():
+        peptide_id = row['identifier']
+        peptide_seq = row['Aminoacids']
+        protein_id = row['Protein_ID'] 
+        
+        # Now use the extended sequence and RSA scores
+        full_prot_seq_for_peptide = extended_full_protein_sequences_dict.get(protein_id)
+        prot_rsa_scores_for_peptide = protein_rsa_map.get(protein_id)
+        s4pred_ss = s4pred_map.get(peptide_id, 'C' * len(peptide_seq))
+
+        task_args.append(
+            (peptide_id, peptide_seq, s4pred_ss, threshold_disorder, 
+             full_prot_seq_for_peptide, prot_rsa_scores_for_peptide, rsa_buried_threshold, protein_id)
+        )
+
+    print(f"Calculating peptide properties for {len(valid_peptides_df)} peptides in parallel (disorder overrides SS, plus buried/exposed)...")
+
+    if num_processes is None:
+        num_processes = min(os.cpu_count() or 1, 4)
+
+    results = []
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        for res in tqdm(pool.imap_unordered(_process_single_peptide_properties, task_args),
+                        total=len(task_args),
+                        desc=f"Processing peptides ({num_processes} cores)"):
+            results.append(res)
+            
+    # Re-add peptides that were filtered out with 0% properties (because of missing Protein_ID)
+    # Create a dummy DataFrame for the removed peptides
+    removed_peptides_df = peptides_df_for_structural_analysis[peptides_df_for_structural_analysis['Protein_ID'].isna()]
+    if not removed_peptides_df.empty:
+        dummy_results = []
+        for _, row in removed_peptides_df.iterrows():
+            dummy_results.append({
+                'identifier': row['identifier'],
+                'Disorder_perc': 0.0, 'Helix_perc': 0.0, 'Sheet_perc': 0.0, 'Coil_perc': 0.0,
+                'Buried_perc': 0.0, 'Exposed_perc': 0.0
+            })
+        results.extend(dummy_results) # Add these dummy results to the main results list
+
+    return pd.DataFrame(results).set_index('identifier')
+
+
+# Helper Function to Plot Average Peptide Properties (no changes needed here)
+def plot_average_properties(average_properties_dict, title, filename_prefix, results_dir):
+    """
+    Plots average peptide properties (Disorder, Helix, Sheet, Coil) for different groups.
+    average_properties_dict: dict of {group_name: pandas.Series of average properties}
+    """
+    if not average_properties_dict:
+        print(f"Skipping plot '{title}': No data provided.")
+        return
+
+    plot_data = []
+    for group_name, series in average_properties_dict.items():
+        if series is not None and not series.empty:
+            # Reorder the series according to PEPTIDE_PROPERTY_TYPES for consistent plotting order
+            ordered_series = series[[f'{prop}_perc' for prop in PEPTIDE_PROPERTY_TYPES]]
+            temp_df = ordered_series.to_frame(name='Percentage').reset_index()
+            temp_df.columns = ['Property', 'Percentage']
+            # Clean up property names for plotting (remove '_perc')
+            temp_df['Property'] = temp_df['Property'].str.replace('_perc', '')
+            temp_df['Group'] = group_name
+            plot_data.append(temp_df)
+        else:
+            print(f"Warning: No valid average property data for group '{group_name}' in '{title}'.")
+
+    if not plot_data:
+        print(f"Skipping plot '{title}': No valid dataframes to concatenate.")
+        return
+
+    plot_df = pd.concat(plot_data)
+
+    plt.figure(figsize=(16, 8))
+    sns.barplot(data=plot_df, x='Property', y='Percentage', hue='Group', palette='Spectral', ci=None)
+    plt.title(f'Average Peptide Properties: {title}', fontsize=16)
+    plt.xlabel('Peptide Property', fontsize=12)
+    plt.ylabel('Average Percentage (%)', fontsize=12)
+    plt.xticks(rotation=0)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.legend(title='Group', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plot_path = os.path.join(results_dir, f"{filename_prefix}_peptide_properties.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f"Saved plot: {plot_path}")
+
+
+
+# Filter DataFrames for VT or VP peptides
+print("\n Filtering Data")
+full_library_filtered = full_library_df[full_library_df['code'].isin(['VT', 'VP'])].copy()
+if args.max_peptides is not None:
+    full_library_filtered = full_library_filtered.head(args.max_peptides).copy()
+    print(f"Limiting structural predictions to {len(full_library_filtered)} peptides for a smoke test.")
+RITA_exp_filtered = RITA_exp_df[RITA_exp_df['type'].isin(['VT', 'VP'])].copy()
+RITA_exp_filtered['identifier'] = RITA_exp_filtered['tileID']
+if args.max_peptides is not None:
+    RITA_exp_filtered = RITA_exp_filtered[
+        RITA_exp_filtered['identifier'].isin(full_library_filtered['identifier'])
+    ].copy()
+
+
+print(f"Number of peptides in full library (VT/VP): {len(full_library_filtered)}")
+print(f"Number of peptides used in RITA experiment (VT/VP): {len(RITA_exp_filtered)}")
+
+
+# Peptides Used vs. Not Used in Experiment (from the VT/VP filtered library)
+used_sequences_set = set(RITA_exp_filtered['Aminoacids'].unique())
+not_used_peptides_df = full_library_filtered[~full_library_filtered['Aminoacids'].isin(used_sequences_set)].copy()
+
+num_used = len(used_sequences_set)
+num_not_used = len(not_used_peptides_df['Aminoacids'].unique()) # Unique counts for 'not used'
+print(f"\nComparison of Used vs. Not Used peptides (from VT/VP library):")
+print(f"  Total unique peptides in full library (VT/VP): {len(full_library_filtered['Aminoacids'].unique())}")
+print(f"  Unique peptides USED in experiment: {num_used} ({num_used / len(full_library_filtered['Aminoacids'].unique()):.2%})")
+print(f"  Unique peptides NOT USED in experiment: {num_not_used} ({num_not_used / len(full_library_filtered['Aminoacids'].unique()):.2%})")
+
+
+# Experiment Significant vs. Non-Significant (from VT/VP used in experiment)
+RITA_sig = RITA_exp_filtered[RITA_exp_filtered['sig'] == 'Yes'].copy()
+RITA_non_sig = RITA_exp_filtered[RITA_exp_filtered['sig'] == 'No'].copy()
+
+
+print(f"\nSignificant vs. Non-Significant peptides (from VT/VP used in experiment):")
+print(f"  Number of significant peptides: {len(RITA_sig)}")
+print(f"  Number of non-significant peptides: {len(RITA_non_sig)}")
+
+# Experiment Upregulated vs. Downregulated Significant (from VT/VP used and significant)
+# Ensure log2FoldChange is numeric before comparison
+RITA_sig['log2FoldChange'] = pd.to_numeric(RITA_sig['log2FoldChange'], errors='coerce')
+RITA_up = RITA_sig[RITA_sig['log2FoldChange'] > 0].copy()
+RITA_down = RITA_sig[RITA_sig['log2FoldChange'] < 0].copy()
+
+
+print(f"\nUpregulated vs. Downregulated Significant peptides:")
+print(f"  Number of upregulated significant peptides: {len(RITA_up)}")
+print(f"  Number of downregulated significant peptides: {len(RITA_down)}")
+print(f"  Number of significant peptides with logFC = 0 (or NaN): {len(RITA_sig) - len(RITA_up) - len(RITA_down)}")
+
+
+# Define the peptide property types for consistent ordering in plots.
+# 'Disorder' will be mutually exclusive with Helix/Sheet/Coil.
+PEPTIDE_PROPERTY_TYPES = ['Disorder', 'Helix', 'Sheet', 'Coil', 'Buried', 'Exposed']
+
+# This assumes full_library_df already has 'NCBI_id' and 'Uniprot_id' columns.
+# It will use NCBI_id if present, otherwise Uniprot_id. If both are NaN, Protein_ID will be NaN.
+full_library_filtered['Protein_ID'] = full_library_filtered['NCBI_id'].fillna(full_library_filtered['Uniprot_id'])
+if args.max_peptides is not None:
+    required_proteins = set(full_library_filtered['Protein_ID'].dropna().astype(str))
+    full_proteins_df = full_proteins_df[
+        full_proteins_df['Identifier'].astype(str).isin(required_proteins)
+    ].copy()
+
+
+# Calculate all peptide properties once 
+print("\nCalculating all unique peptide properties (Disorder, Secondary Structure) ONCE")
+all_peptides_properties_df = calculate_all_peptide_structural_properties(
+    full_library_filtered[['identifier', 'Aminoacids', 'Protein_ID']],
+    full_proteins_df,
+    threshold_disorder=0.5,
+    rsa_buried_threshold=RSA_BURIED_THRESHOLD,
+    num_processes=None
+)
+
+print("\nGenerating comprehensive peptide properties and metadata table...")
+
+# Start with the basic peptide info (identifier, sequence, NCBI_id) from the filtered full library
+comprehensive_peptide_table = full_library_filtered[['identifier', 'Aminoacids', 'NCBI_id', 'Uniprot_id', 'Protein_ID']].copy()
+
+# Merge with the calculated structural properties from all_peptides_properties_df
+comprehensive_peptide_table = comprehensive_peptide_table.merge(
+    all_peptides_properties_df,
+    left_on='identifier',
+    right_index=True,
+    how='left' # Use left merge to keep all peptides from base table
+)
+
+# Prepare RITA experiment data for merging
+rita_metadata_for_merge = RITA_exp_filtered[['identifier', 'sig', 'log2FoldChange', 'padj']].copy()
+
+# Merge RITA experiment metadata
+comprehensive_peptide_table = comprehensive_peptide_table.merge(
+    rita_metadata_for_merge,
+    on='identifier',
+    how='left'
+)
+
+# Display the first few rows of the new table
+print("\nFirst 5 rows of the comprehensive peptide table:")
+print(comprehensive_peptide_table.head())
+print(f"\nShape of the comprehensive peptide table: {comprehensive_peptide_table.shape}")
+print(f"Columns in the comprehensive peptide table: {comprehensive_peptide_table.columns.tolist()}")
+
+
+# Save the comprehensive table to a CSV file
+comprehensive_table_path = os.path.join(RESULTS_DIR, "comprehensive_peptide_properties_and_metadata_with_RSA.csv")
+comprehensive_peptide_table.to_csv(comprehensive_table_path, index=False)
+print(f"\nSaved comprehensive peptide table to: {comprehensive_table_path}")
+
+
+#  Retrieve Peptide Properties for Each Group from the pre-calculated data 
+print("\nRetrieving and Averaging Peptide Properties for Each Group")
+
+average_properties_series = {}
+
+def get_avg_props(identifiers_series, df_source):
+    if identifiers_series.empty:
+        return pd.Series({f'{prop}_perc': 0.0 for prop in PEPTIDE_PROPERTY_TYPES})
+    unique_ids = identifiers_series.unique()
+    existing_ids = df_source.index.intersection(unique_ids)
+    if existing_ids.empty:
+        print(f"Warning: No properties found for identifiers in group. Returning zeros for {len(unique_ids)} peptides.")
+        return pd.Series({f'{prop}_perc': 0.0 for prop in PEPTIDE_PROPERTY_TYPES})
+    
+    props_df = df_source.loc[existing_ids]
+    # Ensure only the percentage columns are selected for mean calculation
+    return props_df[[f'{prop}_perc' for prop in PEPTIDE_PROPERTY_TYPES]].mean()
+
+
+average_properties_series['Full_Library_VT_VP'] = get_avg_props(full_library_filtered['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_Used_VT_VP'] = get_avg_props(RITA_exp_filtered['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_Not_Used_VT_VP'] = get_avg_props(not_used_peptides_df['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_Significant_VT_VP'] = get_avg_props(RITA_sig['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_NonSignificant_VT_VP'] = get_avg_props(RITA_non_sig['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_Upregulated_VT_VP'] = get_avg_props(RITA_up['identifier'], all_peptides_properties_df)
+average_properties_series['Experiment_Downregulated_VT_VP'] = get_avg_props(RITA_down['identifier'], all_peptides_properties_df)
+
+
+# Generate and Save Peptide Properties Summary Table
+print("\nGenerating Peptide Properties Summary Table")
+all_peptide_properties_avg = pd.DataFrame(average_properties_series).round(2)
+
+print("\nAverage Peptide Properties Summary (Percentages):")
+print(all_peptide_properties_avg)
+properties_summary_table_path = os.path.join(RESULTS_DIR, "peptide_properties_summary_with_RSA.csv")
+all_peptide_properties_avg.to_csv(properties_summary_table_path)
+print(f"\nSaved average peptide properties summary table: {properties_summary_table_path}")
+
+
+# Plotting the Peptide Properties
+print("\nGenerating Peptide Properties Plots")
+
+plot_average_properties(
+    {'Full Library (VT/VP)': average_properties_series['Full_Library_VT_VP'],
+     'Experiment Used (VT/VP)': average_properties_series['Experiment_Used_VT_VP']},
+    'Full Library vs. Experiment Used Peptides (VT/VP)',
+    'full_vs_used_properties_with_RSA',
+    RESULTS_DIR
+)
+plot_average_properties(
+    {'Experiment Used (VT/VP)': average_properties_series['Experiment_Used_VT_VP'],
+     'Experiment Not Used (VT/VP)': average_properties_series['Experiment_Not_Used_VT_VP']},
+    'Experiment Used vs. Not Used Peptides (VT/VP)',
+    'used_vs_not_used_properties_with_RSA',
+    RESULTS_DIR
+)
+plot_average_properties(
+    {'Significant (VT/VP)': average_properties_series['Experiment_Significant_VT_VP'],
+     'Non-Significant (VT/VP)': average_properties_series['Experiment_NonSignificant_VT_VP']},
+    'Experiment Significant vs. Non-Significant Peptides (VT/VP)',
+    'significant_vs_nonsignificant_properties_with_RSA',
+    RESULTS_DIR
+)
+plot_average_properties(
+    {'Upregulated Significant (VT/VP)': average_properties_series['Experiment_Upregulated_VT_VP'],
+     'Downregulated Significant (VT/VP)': average_properties_series['Experiment_Downregulated_VT_VP']},
+    'Upregulated vs. Downregulated Significant Peptides (VT/VP)',
+    'upregulated_vs_downregulated_properties_with_RSA',
+    RESULTS_DIR
+)
+
+plot_average_properties(
+    {'Full Library (VT/VP)': average_properties_series['Full_Library_VT_VP'],
+     'Significant (VT/VP)': average_properties_series['Experiment_Significant_VT_VP'],
+     'Non-Significant (VT/VP)': average_properties_series['Experiment_NonSignificant_VT_VP'],
+     'Upregulated Significant (VT/VP)': average_properties_series['Experiment_Upregulated_VT_VP'],
+     'Downregulated Significant (VT/VP)': average_properties_series['Experiment_Downregulated_VT_VP']},
+    'Comparison of Peptides (VT/VP)',
+    'comparison_peptide_properties',
+    RESULTS_DIR
+)
+
+print("\nAll Analysis Complete! Check your results directory for summary CSVs and plots.")

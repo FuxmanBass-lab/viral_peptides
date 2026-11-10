@@ -1,0 +1,5 @@
+# 2022-10-17 00:23 NetSurfP-3.0 Web: INFO     Started job 01
+# 2022-10-17 00:23 NetSurfP-3.0 Web: INFO     Node: theia
+# 2022-10-17 00:24 NetSurfP-3.0 Web: INFO     Loaded model (10.0 s), starting predictions..
+# 2022-10-17 00:24 NetSurfP-3.0 Web: INFO     Finished predictions (2.3 s, 1.1 s per sequence) ...
+# 2022-10-17 00:24 NetSurfP-3.0 Web: INFO     Total time elapsed: 12.3 s 

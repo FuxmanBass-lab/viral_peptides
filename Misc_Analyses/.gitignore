@@ -1,0 +1,10 @@
+**/__pycache__/
+**/.ipynb_checkpoints/
+**/.DS_Store
+Calculate_Peptide_Properties/NetSurfP-3.0_standalone/build/
+Calculate_Peptide_Properties/NetSurfP-3.0_standalone/dist/
+Calculate_Peptide_Properties/NetSurfP-3.0_standalone/nsp3.egg-info/
+Calculate_Peptide_Properties/NetSurfP-3.0_standalone/models/nsp3.pth
+Calculate_Peptide_Properties/results/
+SLIMs/SLiMSuite/
+SLIMs/Data/elm2019.split.motifs
