@@ -1,7 +1,6 @@
 # Viral peptide analyses
 
-This repository contains two independent, self-contained analysis projects
-related to viral peptide research. They address different questions, use
+This repository contains two independent, self-contained analysis projects. They address different questions, use
 different data and software environments, and can be explored or reproduced
 separately.
 
